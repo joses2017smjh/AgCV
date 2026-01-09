@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large data files
+*.ply
+*.exr
+*.blend
+*.mov
+*.mp4
+
+# Model checkpoints
+checkpoints/
+checkpoints_image/
+*.pth
+*.pt
+*.ckpt
+
+# Wandb logs
+wandb/
+.wandb/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+Untitled
