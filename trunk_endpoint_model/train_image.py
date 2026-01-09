@@ -5,6 +5,7 @@ Uses ResNet + U-Net architecture with camera integration.
 import argparse
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
@@ -26,17 +27,27 @@ def compute_accuracy_metrics(predictions, targets):
     """
     metrics = {}
     
-    # Segmentation accuracy
+    # Segmentation accuracy (pixel-level/token-level accuracy)
     seg_pred = predictions['segmentation'].argmax(dim=1)  # (B, H, W)
     seg_target = targets['segmentation']  # (B, H, W)
     seg_acc = (seg_pred == seg_target).float().mean().item()
     metrics['segmentation_accuracy'] = seg_acc
+    metrics['pixel_accuracy'] = seg_acc  # Token-level accuracy (same as pixel-level)
     
     # IoU for segmentation
     intersection = ((seg_pred == 1) & (seg_target == 1)).float().sum()
     union = ((seg_pred == 1) | (seg_target == 1)).float().sum()
     iou = (intersection / (union + 1e-8)).item()
     metrics['segmentation_iou'] = iou
+    
+    # Per-class accuracy
+    for class_id in [0, 1]:
+        class_mask = (seg_target == class_id)
+        if class_mask.sum() > 0:
+            class_acc = ((seg_pred == class_id) & class_mask).float().sum() / class_mask.sum().item()
+            metrics[f'class_{class_id}_accuracy'] = class_acc.item()
+        else:
+            metrics[f'class_{class_id}_accuracy'] = 0.0
     
     # Depth error (only on tree pixels)
     mask = (seg_target > 0).float().unsqueeze(1)  # (B, 1, H, W)
@@ -86,10 +97,12 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch,
     total_depth_loss = 0.0
     total_radius_loss = 0.0
     total_length_loss = 0.0
+    total_ce_loss = 0.0  # Track cross-entropy loss separately
     
     # Accumulate metrics for epoch average
     epoch_metrics = {
         'segmentation_accuracy': [],
+        'pixel_accuracy': [],
         'segmentation_iou': [],
         'depth_mae': [],
         'radius_mae': [],
@@ -123,6 +136,19 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch,
             loss_dict = criterion(predictions, targets)
             loss = loss_dict['total'] / gradient_accumulation_steps
         
+        # Debug: Check for NaN or zero losses (only on first batch of first epoch)
+        if epoch == 0 and batch_idx == 0:
+            print(f"\nDebug - First batch losses:")
+            print(f"  Total loss: {loss_dict['total'].item():.6f}")
+            print(f"  Seg loss: {loss_dict['segmentation'].item():.6f}")
+            print(f"  Depth loss: {loss_dict['depth'].item():.6f}")
+            print(f"  Radius loss: {loss_dict['radius'].item():.6f}")
+            print(f"  Length loss: {loss_dict['length'].item():.6f}")
+            print(f"  Seg target unique values: {torch.unique(targets['segmentation'])}")
+            print(f"  Seg target sum (tree pixels): {(targets['segmentation'] > 0).sum().item()}")
+            if torch.isnan(loss_dict['total']) or loss_dict['total'].item() == 0.0:
+                print(f"  WARNING: Loss is NaN or zero!")
+        
         # Backward pass
         if mixed_precision:
             scaler.scale(loss).backward()
@@ -152,21 +178,34 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch,
         # Compute accuracy metrics
         batch_metrics = compute_accuracy_metrics(predictions, targets)
         for key in epoch_metrics:
-            epoch_metrics[key].append(batch_metrics[key])
+            if key in batch_metrics:
+                epoch_metrics[key].append(batch_metrics[key])
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Compute cross-entropy loss separately
+        seg_pred_logits = predictions['segmentation']
+        seg_target_labels = targets['segmentation']
+        ce_loss_batch = F.cross_entropy(seg_pred_logits, seg_target_labels).item()
+        total_ce_loss += ce_loss_batch
         
         # Log batch-level metrics (only log on gradient update steps)
         if log_batch and (batch_idx + 1) % gradient_accumulation_steps == 0:
             wandb.log({
                 'train/batch/loss': loss_dict['total'].item(),
                 'train/batch/segmentation_loss': loss_dict['segmentation'].item(),
+                'train/batch/cross_entropy_loss': ce_loss_batch,
                 'train/batch/depth_loss': loss_dict['depth'].item(),
                 'train/batch/radius_loss': loss_dict['radius'].item(),
                 'train/batch/length_loss': loss_dict['length'].item(),
                 'train/batch/segmentation_accuracy': batch_metrics['segmentation_accuracy'],
+                'train/batch/pixel_accuracy': batch_metrics.get('pixel_accuracy', batch_metrics['segmentation_accuracy']),
                 'train/batch/segmentation_iou': batch_metrics['segmentation_iou'],
                 'train/batch/depth_mae': batch_metrics['depth_mae'],
                 'train/batch/radius_mae': batch_metrics['radius_mae'],
                 'train/batch/length_mae': batch_metrics['length_mae'],
+                'train/batch/learning_rate': current_lr,
                 'batch': batch_idx + epoch * len(dataloader),
             })
     
@@ -182,16 +221,36 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch,
     
     # Compute epoch averages
     n_batches = len(dataloader)
+    if n_batches == 0:
+        return {
+            'loss': 0.0,
+            'segmentation_loss': 0.0,
+            'cross_entropy_loss': 0.0,
+            'depth_loss': 0.0,
+            'radius_loss': 0.0,
+            'length_loss': 0.0,
+            'segmentation_accuracy': 0.0,
+            'pixel_accuracy': 0.0,
+            'segmentation_iou': 0.0,
+            'depth_mae': 0.0,
+            'radius_mae': 0.0,
+            'length_mae': 0.0,
+        }
+    
     epoch_avg_metrics = {
         'loss': total_loss / n_batches,
         'segmentation_loss': total_seg_loss / n_batches,
+        'cross_entropy_loss': total_ce_loss / n_batches,
         'depth_loss': total_depth_loss / n_batches,
         'radius_loss': total_radius_loss / n_batches,
         'length_loss': total_length_loss / n_batches,
     }
     
     for key in epoch_metrics:
-        epoch_avg_metrics[f'{key}'] = np.mean(epoch_metrics[key])
+        if len(epoch_metrics[key]) > 0:
+            epoch_avg_metrics[key] = np.mean(epoch_metrics[key])
+        else:
+            epoch_avg_metrics[key] = 0.0
     
     return epoch_avg_metrics
 
@@ -210,21 +269,27 @@ def validate(model, dataloader, criterion, device, epoch, log_batch=True):
     # Accumulate metrics for epoch average
     epoch_metrics = {
         'segmentation_accuracy': [],
+        'pixel_accuracy': [],
         'segmentation_iou': [],
         'depth_mae': [],
         'radius_mae': [],
         'length_mae': []
     }
     
+    # Track cross-entropy loss separately
+    total_ce_loss = 0.0
+    
     n_batches = len(dataloader)
     if n_batches == 0:
         return {
             'loss': float('inf'),
             'segmentation_loss': float('inf'),
+            'cross_entropy_loss': float('inf'),
             'depth_loss': float('inf'),
             'radius_loss': float('inf'),
             'length_loss': float('inf'),
             'segmentation_accuracy': 0.0,
+            'pixel_accuracy': 0.0,
             'segmentation_iou': 0.0,
             'depth_mae': 0.0,
             'radius_mae': 0.0,
@@ -257,20 +322,33 @@ def validate(model, dataloader, criterion, device, epoch, log_batch=True):
             total_radius_loss += loss_dict['radius'].item()
             total_length_loss += loss_dict['length'].item()
             
+            # Compute cross-entropy loss separately
+            seg_pred_logits = predictions['segmentation']
+            seg_target_labels = targets['segmentation']
+            ce_loss_batch = F.cross_entropy(seg_pred_logits, seg_target_labels).item()
+            total_ce_loss += ce_loss_batch
+            
             # Compute accuracy metrics
             batch_metrics = compute_accuracy_metrics(predictions, targets)
             for key in epoch_metrics:
-                epoch_metrics[key].append(batch_metrics[key])
+                if key in batch_metrics:
+                    epoch_metrics[key].append(batch_metrics[key])
+            
+            # Get current learning rate (from model's optimizer if available)
+            # For validation, we'll use the learning rate from the last training step
+            current_lr = 0.0  # Will be set from training loop
             
             # Log batch-level metrics
             if log_batch and batch_idx % 5 == 0:  # Log every 5 batches
                 wandb.log({
                     'val/batch/loss': loss.item(),
                     'val/batch/segmentation_loss': loss_dict['segmentation'].item(),
+                    'val/batch/cross_entropy_loss': ce_loss_batch,
                     'val/batch/depth_loss': loss_dict['depth'].item(),
                     'val/batch/radius_loss': loss_dict['radius'].item(),
                     'val/batch/length_loss': loss_dict['length'].item(),
                     'val/batch/segmentation_accuracy': batch_metrics['segmentation_accuracy'],
+                    'val/batch/pixel_accuracy': batch_metrics.get('pixel_accuracy', batch_metrics['segmentation_accuracy']),
                     'val/batch/segmentation_iou': batch_metrics['segmentation_iou'],
                     'val/batch/depth_mae': batch_metrics['depth_mae'],
                     'val/batch/radius_mae': batch_metrics['radius_mae'],
@@ -279,16 +357,36 @@ def validate(model, dataloader, criterion, device, epoch, log_batch=True):
                 })
     
     # Compute epoch averages
+    if n_batches == 0:
+        return {
+            'loss': float('inf'),
+            'segmentation_loss': float('inf'),
+            'cross_entropy_loss': float('inf'),
+            'depth_loss': float('inf'),
+            'radius_loss': float('inf'),
+            'length_loss': float('inf'),
+            'segmentation_accuracy': 0.0,
+            'pixel_accuracy': 0.0,
+            'segmentation_iou': 0.0,
+            'depth_mae': 0.0,
+            'radius_mae': 0.0,
+            'length_mae': 0.0,
+        }
+    
     epoch_avg_metrics = {
         'loss': total_loss / n_batches,
         'segmentation_loss': total_seg_loss / n_batches,
+        'cross_entropy_loss': total_ce_loss / n_batches,
         'depth_loss': total_depth_loss / n_batches,
         'radius_loss': total_radius_loss / n_batches,
         'length_loss': total_length_loss / n_batches,
     }
     
     for key in epoch_metrics:
-        epoch_avg_metrics[f'{key}'] = np.mean(epoch_metrics[key])
+        if len(epoch_metrics[key]) > 0:
+            epoch_avg_metrics[key] = np.mean(epoch_metrics[key])
+        else:
+            epoch_avg_metrics[key] = 0.0
     
     return epoch_avg_metrics
 
@@ -467,14 +565,17 @@ def main():
             log_dict = {
                 'epoch': epoch + 1,
                 'learning_rate': current_lr,
+                'train/epoch/learning_rate': current_lr,
                 
                 # Train epoch metrics
                 'train/epoch/loss': train_metrics['loss'],
                 'train/epoch/segmentation_loss': train_metrics['segmentation_loss'],
+                'train/epoch/cross_entropy_loss': train_metrics.get('cross_entropy_loss', 0.0),
                 'train/epoch/depth_loss': train_metrics['depth_loss'],
                 'train/epoch/radius_loss': train_metrics['radius_loss'],
                 'train/epoch/length_loss': train_metrics['length_loss'],
                 'train/epoch/segmentation_accuracy': train_metrics['segmentation_accuracy'],
+                'train/epoch/pixel_accuracy': train_metrics.get('pixel_accuracy', train_metrics['segmentation_accuracy']),
                 'train/epoch/segmentation_iou': train_metrics['segmentation_iou'],
                 'train/epoch/depth_mae': train_metrics['depth_mae'],
                 'train/epoch/radius_mae': train_metrics['radius_mae'],
@@ -486,10 +587,12 @@ def main():
                     # Val epoch metrics
                     'val/epoch/loss': val_metrics['loss'],
                     'val/epoch/segmentation_loss': val_metrics['segmentation_loss'],
+                    'val/epoch/cross_entropy_loss': val_metrics.get('cross_entropy_loss', 0.0),
                     'val/epoch/depth_loss': val_metrics['depth_loss'],
                     'val/epoch/radius_loss': val_metrics['radius_loss'],
                     'val/epoch/length_loss': val_metrics['length_loss'],
                     'val/epoch/segmentation_accuracy': val_metrics['segmentation_accuracy'],
+                    'val/epoch/pixel_accuracy': val_metrics.get('pixel_accuracy', val_metrics['segmentation_accuracy']),
                     'val/epoch/segmentation_iou': val_metrics['segmentation_iou'],
                     'val/epoch/depth_mae': val_metrics['depth_mae'],
                     'val/epoch/radius_mae': val_metrics['radius_mae'],
